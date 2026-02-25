@@ -3,7 +3,7 @@
 A Python-based reconciliation tool designed to identify revenue leakage between internal lead generation logs and external buyer reports. This was built specifically to audit Voice AI performance and API delivery consistency.
 
 ## Overview
-The script automates the daily "handshake" audit between our internal records and buyer-side dispositions. It identifies two primary types of revenue risk:
+The script automates the daily "handshake" audit between the internal records and buyer-side dispositions. It identifies two primary types of revenue risk:
 1. **Technical Gaps (Ghost Leads):** Leads successfully generated but never recorded by the buyer API.
 2. **Quality Gaps (Voice AI RCA):** Leads returned by the buyer due to short call durations (<30s), indicating a need for script optimization.
 

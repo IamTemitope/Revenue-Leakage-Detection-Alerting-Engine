@@ -1,113 +1,67 @@
 import pandas as pd
 import gspread
 from google.oauth2.service_account import Credentials
+from google.colab import userdata
 import json
 import datetime
-import os
-import re
-from dotenv import load_dotenv
 
-# 1. LOAD THE ENV
-load_dotenv()
+# --- Setup Connection ---
+secret_json = userdata.get('GCP_JSON')
+info = json.loads(secret_json)
+creds = Credentials.from_service_account_info(info, scopes=["https://www.googleapis.com/auth/spreadsheets"])
+client = gspread.authorize(creds)
 
-# 2. PARSE THE SECRET
-gcp_json = os.getenv('GCP_JSON_ADAPTER')
-
-if not gcp_json:
-    raise EnvironmentError("❌ 'GCP_JSON_ADAPTER' is missing from .env file.")
-
-try:
-    # Strip accidental surrounding quotes
-    gcp_json = gcp_json.strip().strip("'\"")
-
-    # Fix invalid JSON escape sequences (e.g. \m, \e, \i) that appear
-    # when base64 key data gets interpreted by the .env parser on Windows.
-    # Valid JSON escapes are: \" \\ \/ \b \f \n \r \t \uXXXX
-    gcp_json = re.sub(r'\\([^"\\/bfnrtu])', r'\\\\\1', gcp_json)
-
-    info = json.loads(gcp_json)
-
-    # Convert literal '\n' text in private_key into actual newline characters
-    if "private_key" in info:
-        info["private_key"] = info["private_key"].replace("\\n", "\n")
-
-    creds = Credentials.from_service_account_info(
-        info,
-        scopes=["https://www.googleapis.com/auth/spreadsheets"]
-    )
-    client = gspread.authorize(creds)
-    print("✅ Auth Successful.")
-
-except json.JSONDecodeError as e:
-    raise ValueError(f"❌ Auth Failed — invalid JSON: {e}\nDEBUG: String starts with: {gcp_json[:30]!r}")
-
-except Exception as e:
-    raise RuntimeError(f"❌ Auth Failed: {e}")
-
-# 3. CONNECT & LOAD DATA
+# Update this ID if the sheet changes
 SHEET_URL = "https://docs.google.com/spreadsheets/d/1Xq2WX0NSDJJnpIBl4mo71ioKu9Gm0MnYIEx7HgdY67w/edit"
 wb = client.open_by_url(SHEET_URL)
 
+# --- Load Data ---
+# Note: Ensure tab names match exactly (Internal Leads / Buyer Report)
 internal_df = pd.DataFrame(wb.worksheet("Internal Leads").get_all_records())
 buyer_df = pd.DataFrame(wb.worksheet("Buyer Report").get_all_records())
 
-# Validate expected columns exist before proceeding
-required_internal = {'lead_id', 'revenue_expected'}
-required_buyer = {'lead_id', 'disposition', 'call_duration_sec', 'credit_issued'}
-
-missing_internal = required_internal - set(internal_df.columns)
-missing_buyer = required_buyer - set(buyer_df.columns)
-
-if missing_internal:
-    raise ValueError(f"❌ 'Internal Leads' sheet is missing columns: {missing_internal}")
-if missing_buyer:
-    raise ValueError(f"❌ 'Buyer Report' sheet is missing columns: {missing_buyer}")
-
-# 4. AUDIT LOGIC
+# --- Audit Logic ---
+# Merge datasets to find where the buyer report is missing our internal leads
 audit_master = pd.merge(internal_df, buyer_df, on='lead_id', how='left')
 
-# Coerce numeric columns — gspread returns empty cells as empty strings
-audit_master['revenue_expected'] = pd.to_numeric(audit_master['revenue_expected'], errors='coerce').fillna(0)
-audit_master['credit_issued'] = pd.to_numeric(audit_master['credit_issued'], errors='coerce').fillna(0)
-audit_master['call_duration_sec'] = pd.to_numeric(audit_master['call_duration_sec'], errors='coerce')
-
-# Leads with no matching buyer disposition after the merge
+# 1. Ghost Leads: we have them, they don't
 missing_leads = audit_master[audit_master['disposition'].isna()].copy()
 
-# Leads explicitly marked as returned
+# 2. Returns: Buyer marked as returned
 returned_leads = audit_master[audit_master['disposition'] == 'Returned'].copy()
 
-# Returned leads where a real call was never made (exclude NaN durations explicitly)
-voice_fails = returned_leads[
-    returned_leads['call_duration_sec'].notna() &
-    (returned_leads['call_duration_sec'] < 30)
-].copy()
+# 3. Voice AI RCA: Returns where call was too short (< 30s)
+voice_fails = returned_leads[returned_leads['call_duration_sec'] < 30].copy()
 
-# 5. CALCULATIONS
-total_expected = pd.to_numeric(
-    internal_df['revenue_expected'], errors='coerce'
-).fillna(0).sum()
+# --- Calculations ---
+total_expected = internal_df['revenue_expected'].sum()
+risk_amt = missing_leads['revenue_expected'].sum() + returned_leads['credit_issued'].sum()
+leakage_pct = (risk_amt / total_expected) * 100 if total_expected > 0 else 0
 
-risk_amt = (
-    missing_leads['revenue_expected'].fillna(0).sum()
-    + returned_leads['credit_issued'].fillna(0).sum()
-)
+# Grab a few IDs for the logs
+tech_ids = missing_leads['lead_id'].head(3).tolist()
+voice_ids = voice_fails['lead_id'].head(3).tolist()
 
-leakage_pct = (risk_amt / total_expected * 100) if total_expected > 0 else 0.0
+print(f"Audit Complete. Risk: ${risk_amt:,.2f} ({leakage_pct:.2f}%)")
 
-# 6. APPEND TO GOOGLE SHEET
-# Store raw numbers so Sheets can chart/formula them
+# --- Export to Historical Log ---
 results_tab = wb.worksheet("Audit Result")
-timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
 
-new_row = [
-    timestamp,
-    round(risk_amt, 2),
-    round(leakage_pct, 4),
-    len(missing_leads),
-    len(voice_fails),
-    str(missing_leads['lead_id'].head(3).tolist())
+# Check if we need headers (if sheet is new/empty)
+if not results_tab.acell('A1').value:
+    cols = ["Timestamp", "At Risk $", "Leakage %", "Missing Leads", "Short Calls", "Sample IDs"]
+    results_tab.update('A1', [cols])
+
+# Create the new row
+timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+row_to_add = [
+    timestamp, 
+    f"${risk_amt:,.2f}", 
+    f"{leakage_pct:.2f}%", 
+    len(missing_leads), 
+    len(voice_fails), 
+    f"Tech: {tech_ids} | Voice: {voice_ids}"
 ]
 
-results_tab.append_row(new_row)
-print(f"🚀 Audit Completed: {timestamp} | Total Risk: ${risk_amt:,.2f} | Leakage: {leakage_pct:.2f}%")
+results_tab.append_row(row_to_add)
+print("Row appended to Audit Result tab.")

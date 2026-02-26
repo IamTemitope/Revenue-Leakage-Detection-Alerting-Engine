@@ -29,3 +29,7 @@ The output is synced to the **Audit Result** worksheet, providing a historical t
 * Total Leakage Amount ($)
 * Leakage Percentage (%)
 * Specific Lead IDs for Engineering/Product review.
+
+* ## Google Sheet Url
+The sheet used for this project containing `Internal Leads`, `Buyer Report` and `Audit Result` tabs 
+https://docs.google.com/spreadsheets/d/1Xq2WX0NSDJJnpIBl4mo71ioKu9Gm0MnYIEx7HgdY67w/edit?gid=0#gid=0
